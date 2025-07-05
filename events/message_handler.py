@@ -1,10 +1,9 @@
 import discord
 import logging
-import json
 import asyncio
-from datetime import datetime
-from utils.helpers import download_file, is_allowed_extension, format_file_size
-from utils.rate_limiter import rate_limiter
+from datetime import datetime, timezone
+from typing import Optional, Tuple
+from utils.file_manager import FileManager
 
 logger = logging.getLogger(__name__)
 
@@ -13,290 +12,282 @@ class MessageHandler:
         self.bot = bot
         self.db_manager = db_manager
         self.config = config
+        self.file_manager = FileManager(
+            downloads_dir="downloads",
+            max_file_size=config.max_file_size
+        )
     
-    async def handle_message(self, message):
-        """处理新消息"""
+    async def handle_message(self, message: discord.Message):
+        """处理新消息 - 简化版"""
         # 忽略机器人消息
         if message.author.bot:
             return
         
-        # 记录所有接收到的消息
-        logger.info(f"接收消息: {message.id}, 作者: {message.author.name}, 频道: {message.channel.name}, 类型: {type(message.channel).__name__}")
-        
-        # 正确识别频道和帖子
-        if isinstance(message.channel, discord.Thread):
-            # 消息在帖子中
-            thread_id = message.channel.id
-            channel_id = message.channel.parent.id
-        else:
-            # 消息在普通频道中
-            thread_id = None
-            channel_id = message.channel.id
-        
-        # 检查是否有备份配置
-        backup_config = await self.db_manager.get_backup_config(
-            message.guild.id,
-            channel_id,
-            thread_id,
-            message.author.id
-        )
-        
-        if not backup_config:
-            logger.info(f"未找到备份配置 - 频道: {channel_id}, 帖子: {thread_id}, 作者: {message.author.id}")
-            return
-        
-        logger.info(f"处理新消息: {message.id}, 作者: {message.author.name}, 频道: {channel_id}, 帖子: {thread_id}")
-        
-        # 获取内容类型和备份规则
-        content_type_info = await self.db_manager.get_content_type_by_config(backup_config[0])
-        backup_rules = {}
-        if content_type_info:
-            backup_rules = json.loads(content_type_info[2])  # backup_rules字段
-        
-        # 备份消息
-        await self._backup_message(message, backup_config[0], backup_rules)
-    
-    async def _backup_message(self, message, config_id, backup_rules=None):
-        """备份单个消息"""
         try:
-            if backup_rules is None:
-                backup_rules = {}
-            
-            # 检查是否应该备份此消息
-            if not self._should_backup_message(message, backup_rules):
-                return
-            
-            # 根据内容类型处理不同的备份逻辑
-            content_to_backup = self._get_content_to_backup(message, backup_rules)
-            
-            # 备份消息内容
-            message_backup_id = await self.db_manager.backup_message(
-                config_id,
-                message.id,
-                message.author.id,
-                content_to_backup,
-                message.created_at
-            )
-            
-            if not message_backup_id:
-                return
-            
-            # 备份附件（如果规则允许）
-            if backup_rules.get('backup_attachments', True) and message.attachments:
-                await self._backup_attachments(message.attachments, message_backup_id)
-            
-            # 备份嵌入内容中的文件
-            if message.embeds:
-                await self._backup_embeds(message.embeds, message_backup_id)
-            
-            logger.info(f"成功备份消息: {message.id}")
-            
-        except Exception as e:
-            logger.error(f"备份消息失败: {message.id}, 错误: {e}")
-    
-    def _should_backup_message(self, message, backup_rules):
-        """检查是否应该备份此消息"""
-        # 如果规则中指定只备份作者消息，且当前消息不是作者的，则跳过
-        if backup_rules.get('backup_author_posts_only', False) or backup_rules.get('backup_author_messages_only', False):
-            # 这个检查已经在上层处理了，这里总是返回True
-            return True
-        
-        # 其他规则检查
-        return True
-    
-    def _get_content_to_backup(self, message, backup_rules):
-        """根据备份规则获取要备份的内容"""
-        content = message.content
-        
-        # 如果是帖子，处理特殊逻辑
-        if isinstance(message.channel, discord.Thread):
-            # 获取帖子标题
-            thread_title = message.channel.name
-            
-            # 如果是第一条消息且需要备份帖子标题
-            if backup_rules.get('backup_thread_title', False):
-                if not content.startswith(thread_title):
-                    content = f"[帖子标题: {thread_title}]\n{content}"
-            
-            # 如果是第一条消息且需要备份顶楼内容
-            if backup_rules.get('backup_first_post', False):
-                # 这里可以添加特殊标记来标识这是顶楼内容
-                if self._is_first_post(message):
-                    content = f"[顶楼内容]\n{content}"
-        
-        # 如果是频道，处理特殊逻辑
-        elif backup_rules.get('backup_channel_name', False):
-            channel_name = message.channel.name
-            content = f"[频道: {channel_name}]\n{content}"
-        
-        return content
-    
-    def _is_first_post(self, message):
-        """检查是否是帖子的第一条消息"""
-        # 这个检查比较复杂，需要获取帖子历史
-        # 简单起见，这里返回True，实际应用中可以优化
-        return True
-    
-    async def _backup_attachments(self, attachments, message_backup_id):
-        """备份附件"""
-        for attachment in attachments:
-            if not is_allowed_extension(attachment.filename, self.config.allowed_extensions):
-                logger.info(f"跳过不允许的文件类型: {attachment.filename}")
-                continue
-            
-            if attachment.size > self.config.max_file_size:
-                logger.info(f"跳过过大的文件: {attachment.filename}, 大小: {format_file_size(attachment.size)}")
-                continue
-            
-            # 下载文件
-            file_data = await download_file(attachment.url, self.config.max_file_size)
-            
-            # 备份文件信息
-            await self.db_manager.backup_file(
-                message_backup_id,
-                attachment.filename,
-                attachment.size,
-                attachment.url,
-                file_data
-            )
-            
-            logger.info(f"备份附件: {attachment.filename}")
-    
-    async def _backup_embeds(self, embeds, message_backup_id):
-        """备份嵌入内容"""
-        for embed in embeds:
-            # 备份嵌入的图片
-            if embed.image:
-                await self._backup_embed_media(embed.image.url, message_backup_id, "embed_image")
-            
-            # 备份嵌入的缩略图
-            if embed.thumbnail:
-                await self._backup_embed_media(embed.thumbnail.url, message_backup_id, "embed_thumbnail")
-    
-    async def _backup_embed_media(self, url, message_backup_id, media_type):
-        """备份嵌入媒体"""
-        try:
-            # 简单的文件名生成
-            filename = f"{media_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            
-            # 下载文件
-            file_data = await download_file(url, self.config.max_file_size)
-            
-            if file_data:
-                await self.db_manager.backup_file(
-                    message_backup_id,
-                    filename,
-                    len(file_data),
-                    url,
-                    file_data
-                )
-                logger.info(f"备份嵌入媒体: {filename}")
-        except Exception as e:
-            logger.error(f"备份嵌入媒体失败: {url}, 错误: {e}")
-    
-    async def scan_channel_history(self, channel, author_id, config_id, limit=None, after_time=None):
-        """扫描频道历史消息"""
-        if limit is None:
-            limit = self.config.max_scan_messages
-        
-        logger.info(f"开始扫描频道历史: {channel.name}, 作者: {author_id}, 限制: {limit}")
-        if after_time:
-            logger.info(f"只扫描 {after_time} 之后的消息")
-        
-        scanned_count = 0
-        backed_up_count = 0
-        
-        try:
-            # 获取备份规则
-            content_type_info = await self.db_manager.get_content_type_by_config(config_id)
-            backup_rules = {}
-            if content_type_info:
-                backup_rules = json.loads(content_type_info[2])
-            
-            # 获取最新备份的消息时间（除非指定了after_time）
-            if not after_time:
-                latest_time = await self.db_manager.get_latest_message_time(config_id)
+            # 确定位置信息
+            if isinstance(message.channel, discord.Thread):
+                # 帖子消息
+                thread_id = message.channel.id
+                channel_id = message.channel.parent.id
+                location_id = thread_id
+                content_type = "thread"
             else:
-                latest_time = after_time.isoformat() if isinstance(after_time, datetime) else after_time
+                # 频道消息
+                thread_id = None
+                channel_id = message.channel.id
+                location_id = channel_id
+                content_type = "channel"
             
-            # 特殊处理：如果是帖子，需要特别处理第一条消息
-            if isinstance(channel, discord.Thread) and backup_rules.get('backup_first_post', False):
-                await self._backup_thread_first_post(channel, author_id, config_id, backup_rules)
+            # 检查是否有备份配置
+            backup_config = await self.db_manager.get_backup_config(
+                message.guild.id, channel_id, thread_id, message.author.id
+            )
             
-            # 使用速率限制的消息历史获取
-            async for message in self._get_channel_history_with_rate_limit(channel, limit):
+            if not backup_config:
+                return  # 没有配置，不处理
+            
+            config_id = backup_config[0]
+            
+            # 记录活动（更新最后检查时间）
+            await self.db_manager.update_config_check_time(config_id)
+            
+            # 检查并下载附件
+            if message.attachments:
+                await self.process_attachments(message, config_id, location_id)
+            
+            # 如果是帖子的首条消息，保存内容信息
+            if content_type == "thread" and self.is_first_message(message):
+                await self.save_thread_content(message, config_id)
+            
+            logger.debug(f"处理消息完成: {message.id} (作者: {message.author.name})")
+            
+        except Exception as e:
+            logger.error(f"处理消息失败 {message.id}: {e}")
+    
+    async def process_attachments(self, message: discord.Message, config_id: int, location_id: int):
+        """处理消息附件"""
+        for attachment in message.attachments:
+            try:
+                # 检查是否已下载
+                if await self.db_manager.is_file_downloaded(message.id, attachment.filename):
+                    logger.debug(f"文件已下载，跳过: {attachment.filename}")
+                    continue
+                
+                # 下载文件
+                download_result = await self.file_manager.download_discord_attachment(
+                    attachment, message.author.id, location_id
+                )
+                
+                if download_result:
+                    saved_filename, file_path, file_size = download_result
+                    
+                    # 记录到数据库
+                    await self.db_manager.record_file_download(
+                        config_id, message.id, attachment.filename,
+                        saved_filename, file_path, file_size
+                    )
+                    
+                    logger.info(f"下载附件: {attachment.filename} -> {saved_filename} ({self.file_manager.format_file_size(file_size)})")
+                else:
+                    logger.warning(f"下载附件失败: {attachment.filename}")
+                    
+            except Exception as e:
+                logger.error(f"处理附件失败 {attachment.filename}: {e}")
+    
+    async def save_thread_content(self, message: discord.Message, config_id: int):
+        """保存帖子内容信息"""
+        try:
+            # 获取帖子标题和首楼内容
+            thread_title = message.channel.name
+            first_post_content = message.content[:1000] if message.content else None  # 限制长度
+            
+            # 保存内容记录
+            await self.db_manager.save_content_record(
+                config_id=config_id,
+                content_type="thread",
+                title=thread_title,
+                first_post_content=first_post_content,
+                author_name=message.author.name,
+                author_display_name=message.author.display_name or message.author.name
+            )
+            
+            logger.info(f"保存帖子内容: {thread_title}")
+            
+        except Exception as e:
+            logger.error(f"保存帖子内容失败: {e}")
+    
+    def is_first_message(self, message: discord.Message) -> bool:
+        """检查是否是帖子的第一条消息"""
+        if not isinstance(message.channel, discord.Thread):
+            return False
+        
+        # 简单判断：消息ID接近帖子ID说明是首条消息
+        thread_id = message.channel.id
+        message_id = message.id
+        id_diff = abs(message_id - thread_id)
+        
+        # ID差异小于1000通常表示是首条消息
+        return id_diff < 1000
+    
+    async def scan_history(self, guild_id: int, channel_id: int, thread_id: Optional[int], 
+                          author_id: int, config_id: int, after_time: Optional[datetime] = None) -> Tuple[int, int]:
+        """扫描历史消息 - 简化版"""
+        try:
+            # 获取Discord对象
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                logger.error(f"找不到服务器: {guild_id}")
+                return 0, 0
+            
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                logger.error(f"找不到频道: {channel_id}")
+                return 0, 0
+            
+            # 如果是帖子，获取帖子对象
+            if thread_id:
+                thread = channel.get_thread(thread_id)
+                if not thread:
+                    logger.error(f"找不到帖子: {thread_id}")
+                    return 0, 0
+                scan_channel = thread
+                location_id = thread_id
+                content_type = "thread"
+            else:
+                scan_channel = channel
+                location_id = channel_id
+                content_type = "channel"
+            
+            logger.info(f"开始扫描历史: {scan_channel.name} (作者: {author_id})")
+            
+            scanned_count = 0
+            downloaded_count = 0
+            
+            # 扫描历史消息
+            async for message in scan_channel.history(limit=self.config.max_scan_messages):
                 scanned_count += 1
                 
-                # 只备份指定作者的消息
+                # 只处理指定作者的消息
                 if message.author.id != author_id:
                     continue
                 
-                # 如果消息时间早于指定时间，跳过
-                if latest_time:
-                    compare_time = datetime.fromisoformat(latest_time) if isinstance(latest_time, str) else latest_time
-                    if message.created_at <= compare_time:
-                        continue
+                # 如果指定了时间，只处理该时间之后的消息
+                if after_time and message.created_at <= after_time:
+                    continue
                 
-                # 备份消息
-                await self._backup_message(message, config_id, backup_rules)
-                backed_up_count += 1
+                # 处理附件
+                if message.attachments:
+                    for attachment in message.attachments:
+                        if not await self.db_manager.is_file_downloaded(message.id, attachment.filename):
+                            download_result = await self.file_manager.download_discord_attachment(
+                                attachment, author_id, location_id
+                            )
+                            
+                            if download_result:
+                                saved_filename, file_path, file_size = download_result
+                                await self.db_manager.record_file_download(
+                                    config_id, message.id, attachment.filename,
+                                    saved_filename, file_path, file_size
+                                )
+                                downloaded_count += 1
+                                logger.debug(f"历史下载: {attachment.filename}")
                 
-                # 避免超过API限制
-                if scanned_count >= limit:
-                    logger.warning(f"达到扫描限制: {limit}")
-                    break
+                # 如果是帖子的首条消息，保存内容
+                if content_type == "thread" and self.is_first_message(message):
+                    await self.save_thread_content(message, config_id)
                 
-                # 在消息之间添加小延迟
-                await asyncio.sleep(0.1)
-            
-            # 更新最后扫描时间
-            await self.db_manager.update_last_scan_time(config_id)
-            
-            logger.info(f"扫描完成: 扫描 {scanned_count} 条消息, 备份 {backed_up_count} 条消息")
-            
-        except Exception as e:
-            logger.error(f"扫描频道历史失败: {e}")
-        
-        return scanned_count, backed_up_count
-    
-    async def _backup_thread_first_post(self, thread, author_id, config_id, backup_rules):
-        """备份帖子的第一条消息"""
-        try:
-            # 获取帖子的第一条消息
-            async for message in thread.history(limit=1, oldest_first=True):
-                if message.author.id == author_id:
-                    logger.info(f"备份帖子首条消息: {message.id}")
-                    await self._backup_message(message, config_id, backup_rules)
-                break
-        except Exception as e:
-            logger.error(f"备份帖子首条消息失败: {e}")
-    
-    async def _get_channel_history_with_rate_limit(self, channel, limit):
-        """使用速率限制获取频道历史"""
-        try:
-            await rate_limiter.wait_for_rate_limit(f"/channels/{channel.id}/messages", "GET")
-            
-            batch_size = min(100, limit)  # Discord API单次最多100条消息
-            processed = 0
-            
-            async for message in channel.history(limit=batch_size, oldest_first=False):
-                yield message
-                processed += 1
-                
-                # 每处理一批消息后稍作等待
-                if processed % 50 == 0:
+                # 避免过于频繁的API调用
+                if scanned_count % 50 == 0:
                     await asyncio.sleep(1)
-                    
-                if processed >= limit:
-                    break
-                    
-        except discord.HTTPException as e:
-            if e.status == 429:  # Too Many Requests
-                retry_after = int(e.response.headers.get('Retry-After', 5))
-                logger.warning(f"遇到速率限制，等待 {retry_after} 秒")
-                await asyncio.sleep(retry_after)
-                # 递归重试
-                async for message in self._get_channel_history_with_rate_limit(channel, limit):
-                    yield message
+            
+            # 更新检查时间
+            await self.db_manager.update_config_check_time(config_id)
+            
+            logger.info(f"历史扫描完成: 扫描 {scanned_count} 条，下载 {downloaded_count} 个文件")
+            return scanned_count, downloaded_count
+            
+        except Exception as e:
+            logger.error(f"历史扫描失败: {e}")
+            return 0, 0
+    
+    async def send_notification_card(self, guild_id: int, channel_id: int, thread_id: Optional[int],
+                                   author_id: int, action: str, work_title: str = ""):
+        """发送通知卡片"""
+        try:
+            # 获取Discord对象
+            guild = self.bot.get_guild(guild_id)
+            if not guild:
+                return
+            
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                return
+            
+            if thread_id:
+                thread = channel.get_thread(thread_id)
+                if thread:
+                    channel = thread
+                else:
+                    return
+            
+            # 获取用户对象
+            user = guild.get_member(author_id)
+            if not user:
+                try:
+                    user = await self.bot.fetch_user(author_id)
+                except:
+                    user = None
+            
+            # 创建美观的卡片消息
+            if action == "enable":
+                embed = discord.Embed(
+                    title="🔒 此作品已启用备份功能",
+                    description="系统将自动备份您在此位置上传的文件",
+                    color=discord.Color.green()
+                )
+                embed.add_field(
+                    name="📁 备份内容",
+                    value="• 您上传的所有文件和附件\n• 帖子的标题和首楼内容\n• 文件的原始信息和元数据",
+                    inline=False
+                )
+                embed.add_field(
+                    name="⚖️ 版权声明",
+                    value="• 本系统仅提供备份存储服务，您的作品版权完全属于您本人，未经您同意，本系统不会以任何形式使用您的作品。",
+                    inline=False
+                )
+                embed.set_footer(text="PenPreserve • 让作品永久保存")
+                embed.timestamp = datetime.now(timezone.utc)
+                
             else:
-                raise 
+                embed = discord.Embed(
+                    title="⏸️ 此作品已停用备份功能",
+                    description="系统已停止备份您在此位置上传的文件",
+                    color=discord.Color.orange()
+                )
+                embed.add_field(
+                    name="📂 现有备份",
+                    value="• 已备份的文件将继续保留\n• 可随时重新启用备份功能",
+                    inline=False
+                )
+                embed.add_field(
+                    name="⚖️ 版权声明",
+                    value="• 本系统仅提供备份存储服务，您的作品版权完全属于您本人，未经您同意，本系统不会以任何形式使用您的作品。",
+                    inline=False
+                )
+                embed.set_footer(text="PenPreserve • 让作品永久保存")
+                embed.timestamp = datetime.now(timezone.utc)
+            
+            # 发送卡片消息
+            await channel.send(embed=embed)
+            logger.info(f"发送通知卡片: {action} 给 {author_id}")
+            
+        except Exception as e:
+            logger.error(f"发送通知卡片失败: {e}")
+    
+    def get_content_preview(self, content: str) -> str:
+        """获取内容预览"""
+        if not content:
+            return "[空消息]"
+        
+        preview = content.replace('\n', ' ').replace('\r', ' ').strip()
+        return preview[:100] + "..." if len(preview) > 100 else preview

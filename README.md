@@ -14,13 +14,16 @@
 - 🎯 **差异化备份**: 支持帖子和频道子区的不同备份策略
 - ⚡ **Webhook支持**: 实时接收协议授权更新
 - 🔍 **历史扫描**: 自动扫描和备份历史内容
+- ✅ **启停控制**: 支持启用和暂停备份功能
+- 🔍 **智能扫描**: 准实时扫描任务处理（10秒/1秒智能频率）
+- 🚫 **重复检测**: 防止重复备份和宕机恢复时的数据重复
 
 ## 安装步骤
 
 1. **克隆或下载项目**
    ```bash
    git clone <repository-url>
-   cd discord-backup-bot
+   cd PenPreserve
    ```
 
 2. **安装依赖**
@@ -35,20 +38,16 @@
 
 4. **运行机器人**
    
-   - 仅运行Discord Bot:
    ```bash
    python main.py
-   ```
-   
-   - 同时运行Discord Bot和Webhook服务器:
-   ```bash
-   python main.py --webhook
    ```
    
    - 使用自定义配置文件:
    ```bash
    python main.py --config path/to/config.cfg
    ```
+   
+   > **注意**: Bot和Webhook服务器会一起启动，是否启用Webhook功能由配置文件中的 `webhook.enabled` 设置决定。
 
 ## 配置说明
 
@@ -84,13 +83,16 @@ enabled=true                     # 是否启用Webhook服务器
 
 ## 使用方法
 
-### 斜杠命令（备用管理）
+### 斜杠命令
 
 1. **`/enable_backup`** - 手动为当前频道/帖子启用备份功能（备用选项）
 2. **`/disable_backup`** - 禁用当前频道/帖子的备份功能
 3. **`/backup_status`** - 查看当前频道/帖子的备份状态
 4. **`/status`** - 查看Bot运行状态和宕机恢复信息
 5. **`/force_recovery`** - 强制执行宕机恢复（测试功能）
+6. **`/simulate_protocol`** - 模拟协议授权bot的webhook请求（测试用）
+   - `target_user`: 要操作备份的用户（默认为自己）
+   - `enable_backup`: 是否启用备份（true=启用，false=暂停）
 
 > **注意**: 推荐使用协议授权bot联动来自动启用备份，手动命令仅用于特殊情况或管理需要。
 
@@ -98,33 +100,35 @@ enabled=true                     # 是否启用Webhook服务器
 
 机器人支持与协议授权bot联动，当作者签署允许备份的协议时，协议授权bot会发送POST请求到 `/webhook/license-permission` 端点。
 
-#### Webhook请求格式
+#### Webhook请求格式（简化版）
 
 ```json
 {
   "event_type": "backup_permission_update",
-  "timestamp": "2025-01-04T10:30:00Z",
   "guild_id": "123456789012345678",
   "channel_id": "987654321098765432", 
   "thread_id": "456789012345678901",
-  "message_id": "789012345678901234",
-  "author": {
-    "discord_user_id": "111222333444555666",
-    "username": "用户名",
-    "display_name": "显示名称"
-  },
-  "work_info": {
-    "title": "作品标题",
-    "content_preview": "作品内容预览...",
-    "license_type": "custom",
-    "backup_allowed": true
-  },
-  "urls": {
-    "discord_thread": "https://discord.com/channels/server/channel/thread",
-    "direct_message": "https://discord.com/channels/server/channel/message"
-  }
+  "author_id": "111222333444555666",
+  "backup_allowed": true
 }
 ```
+
+**重要变更**: Webhook数据结构已简化，只包含Bot无法自行获取的核心信息：
+- `event_type`: 事件类型（固定为"backup_permission_update"）
+- `guild_id`: 服务器ID
+- `channel_id`: 频道ID
+- `thread_id`: 帖子ID（可选）
+- `author_id`: 作者用户ID
+- `backup_allowed`: 备份控制（true=启用，false=暂停）
+
+Bot会自动获取用户名、显示名、频道标题等信息，无需在webhook中传输。
+
+#### Webhook响应状态码
+
+- **`enabling`**: 正在创建备份配置
+- **`already_enabled`**: 备份已经启用
+- **`disabling`**: 正在禁用备份配置
+- **`not_found`**: 未找到要禁用的备份配置
 
 #### 备份策略
 
@@ -135,9 +139,11 @@ enabled=true                     # 是否启用Webhook服务器
 
 - **协议联动**: 与协议授权bot联动，自动处理备份权限（主要方式）
 - **消息监听**: 持续监听已启用备份的频道/帖子中的新消息
-- **宕机恢复**: 机器人重启后自动扫描宕机期间的消息
+- **宕机恢复**: 机器人重启后自动扫描宕机期间的消息（按配置分别恢复）
 - **历史扫描**: 接收到备份权限后，自动扫描历史内容
 - **速率限制**: 智能处理Discord API速率限制
+- **智能扫描**: 有任务时1秒检查，无任务时10秒检查，实现准实时处理
+- **重复检测**: 防止重复备份已存在的消息
 
 ## 项目结构
 
@@ -187,9 +193,27 @@ PenPreserve/
 - **backup_configs**: 备份配置表
 - **message_backups**: 消息备份表  
 - **file_backups**: 文件备份表
-- **authors**: 作者信息表（新增）
-- **scan_tasks**: 扫描任务表（新增）
-- **content_types**: 内容类型表（新增）
+- **authors**: 作者信息表
+- **scan_tasks**: 扫描任务表
+- **content_types**: 内容类型表
+- **bot_status**: Bot状态表（启动/关闭时间）
+
+## 技术特性
+
+### 性能优化
+- **智能扫描频率**: 有任务时高频检查(1秒)，无任务时低频检查(10秒)
+- **并发处理**: 使用asyncio并发处理多个扫描任务和恢复任务
+- **速率限制**: 智能处理Discord API限制，避免429错误
+
+### 数据完整性
+- **重复检测**: 消息备份前先检查是否已存在
+- **分配置恢复**: 宕机恢复时按每个配置的最新消息时间分别处理
+- **事务安全**: 数据库操作使用事务确保一致性
+
+### 用户体验
+- **简化通知**: 只发送"已为您开启/暂停备份功能"简洁消息
+- **自动检测**: 斜杠命令自动检测环境（频道/帖子）信息
+- **状态反馈**: 提供详细的状态查询和错误信息
 
 ## 注意事项
 
@@ -198,6 +222,7 @@ PenPreserve/
 3. **API限制**: 机器人会自动处理Discord API的速率限制
 4. **存储空间**: 备份文件会占用磁盘空间，请定期清理
 5. **隐私保护**: 机器人只会备份作者自己的内容
+6. **Webhook简化**: 新版webhook只需传输核心控制信息，其他信息由Bot自动获取
 
 ## 常见问题
 
@@ -214,10 +239,16 @@ A: 备份的文件存储在SQLite数据库中，可以通过数据库查看工�
 A: 日志文件位于 `logs/bot.log`，也可以在控制台查看实时日志。
 
 **Q: 如何测试Webhook功能？**
-A: 运行 `python scripts/test_webhook.py` 来测试Webhook功能是否正常。
+A: 使用 `/simulate_protocol` 斜杠命令来测试webhook功能，支持启用和暂停操作。
 
 **Q: 备份策略如何工作？**
 A: 帖子和频道子区使用不同的备份策略，详见上方"备份策略"部分。
+
+**Q: 如何暂停已启用的备份？**
+A: 发送webhook请求时设置 `"backup_allowed": false`，或使用 `/simulate_protocol enable_backup:False` 测试。
+
+**Q: 宕机恢复如何工作？**
+A: 机器人重启后会检查每个配置的最新消息时间，只恢复该时间之后的消息，避免重复备份。
 
 ## 支持与贡献
 
@@ -225,4 +256,4 @@ A: 帖子和频道子区使用不同的备份策略，详见上方"备份策略"
 
 ## 许可证
 
-本项目采用MIT许可证，详情请查看LICENSE文件。 
+本项目采用MIT许可证，详情请查看LICENSE文件。

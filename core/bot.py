@@ -2,10 +2,11 @@ import discord
 from discord.ext import commands
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from database.models import DatabaseManager
 from events.message_handler import MessageHandler
-from utils.helpers import safe_send_message
+from server.webhook_server import get_webhook_server
+from utils.reconnect_manager import ReconnectManager
 
 logger = logging.getLogger(__name__)
 
@@ -14,10 +15,10 @@ class DiscordBot(commands.Bot):
         self.config = config
         
         # 设置Bot意图
-        intents = discord.Intents.default()
-        intents.message_content = True
+        intents = discord.Intents.none()
         intents.guilds = True
         intents.messages = True
+        intents.message_content = True
         
         # 初始化Bot
         super().__init__(
@@ -31,8 +32,12 @@ class DiscordBot(commands.Bot):
         self.message_handler = MessageHandler(self, self.db_manager, config)
         
         # 状态变量
-        self.last_shutdown_time = None
         self.startup_time = None
+        self.last_shutdown_time = None
+        self.webhook_processor_running = False
+        
+        # 重连管理器
+        self.reconnect_manager = ReconnectManager(self)
     
     async def setup_hook(self):
         """Bot启动时的设置"""
@@ -55,202 +60,192 @@ class DiscordBot(commands.Bot):
     
     async def on_ready(self):
         """当Bot准备就绪时"""
-        self.startup_time = datetime.now()
+        self.startup_time = datetime.now(timezone.utc)
         logger.info(f"Bot已登录: {self.user.name} (ID: {self.user.id})")
         logger.info(f"已连接到 {len(self.guilds)} 个服务器")
         
-        # 保存启动时间到数据库
+        # 保存启动时间
         await self.db_manager.save_startup_time(self.startup_time)
         
-        # 从数据库获取上次关闭时间
+        # 获取上次关闭时间
         self.last_shutdown_time = await self.db_manager.get_last_shutdown_time()
         
         # 设置Bot状态
         await self.set_activity()
         
-        # 处理宕机恢复
-        await self.handle_downtime_recovery()
+        # 启动后台任务
+        self.start_background_tasks()
         
-        # 处理待处理的扫描任务
-        await self.process_pending_scan_tasks()
+        # 显示统计信息
+        configs = await self.db_manager.get_all_backup_configs()
+        logger.info(f"当前有 {len(configs)} 个活跃备份配置")
         
-        # 启动定期扫描任务处理
-        self.start_periodic_scan_task_processing()
-        
-        # 显示当前所有备份配置（用于调试）
-        await self.log_backup_configs()
+        logger.info("Bot启动完成")
     
-    async def log_backup_configs(self):
-        """记录所有备份配置（用于调试）"""
-        try:
-            configs = await self.db_manager.get_all_backup_configs()
-            logger.info(f"当前共有 {len(configs)} 个备份配置:")
-            for config in configs:
-                config_id, guild_id, channel_id, thread_id, author_id, enabled, created_at, last_scan_time = config
-                guild = self.get_guild(guild_id)
-                guild_name = guild.name if guild else f"未知服务器({guild_id})"
-                logger.info(f"  配置ID: {config_id}, 服务器: {guild_name}, 频道ID: {channel_id}, 帖子ID: {thread_id}, 作者ID: {author_id}")
-        except Exception as e:
-            logger.error(f"记录备份配置失败: {e}")
+    def start_background_tasks(self):
+        """启动后台任务"""
+        # 宕机恢复任务
+        asyncio.create_task(self.handle_downtime_recovery())
+        
+        # Webhook通知处理任务
+        if get_webhook_server():
+            asyncio.create_task(self.process_webhook_notifications())
+            self.webhook_processor_running = True
+        
+        logger.info("后台任务已启动")
     
     async def set_activity(self):
         """设置Bot活动状态"""
         try:
-            activity_type = getattr(discord.ActivityType, self.config.activity_type, discord.ActivityType.playing)
-            activity = discord.Activity(type=activity_type, name=self.config.activity_name)
+            activity = discord.Activity(
+                type=discord.ActivityType.watching,
+                name="文件备份系统"
+            )
             await self.change_presence(activity=activity)
-            logger.info(f"设置活动状态: {self.config.activity_type} {self.config.activity_name}")
+            logger.info("设置活动状态完成")
         except Exception as e:
             logger.error(f"设置活动状态失败: {e}")
     
     async def handle_downtime_recovery(self):
-        """处理宕机恢复"""
-        if not self.last_shutdown_time:
-            logger.info("首次启动，跳过宕机恢复")
-            return
-        
-        # 解析时间字符串为datetime对象
-        if isinstance(self.last_shutdown_time, str):
-            try:
-                self.last_shutdown_time = datetime.fromisoformat(self.last_shutdown_time)
-            except ValueError:
-                logger.error(f"无法解析关闭时间: {self.last_shutdown_time}")
-                return
-        
-        # 计算宕机时长
-        downtime = self.startup_time - self.last_shutdown_time
-        logger.info(f"检测到宕机，持续时间: {downtime}")
-        logger.info(f"上次关闭时间: {self.last_shutdown_time}")
-        logger.info(f"本次启动时间: {self.startup_time}")
-        
-        # 获取所有备份配置
-        configs = await self.db_manager.get_all_backup_configs()
-        
-        if not configs:
-            logger.info("没有备份配置，跳过宕机恢复")
-            return
-        
-        logger.info(f"开始处理宕机恢复，共 {len(configs)} 个配置...")
-        
-        recovery_tasks = []
-        for config in configs:
-            task = asyncio.create_task(self.recover_config(config))
-            recovery_tasks.append(task)
-        
-        if recovery_tasks:
-            await asyncio.gather(*recovery_tasks, return_exceptions=True)
-        
-        logger.info("宕机恢复完成")
-    
-    async def recover_config(self, config):
-        """恢复单个配置的消息"""
+        """处理宕机恢复 - 简化版"""
         try:
-            guild = self.get_guild(config[1])  # guild_id
-            if not guild:
-                logger.warning(f"找不到服务器 ID: {config[1]}")
+            await asyncio.sleep(2)  # 等待Bot完全启动
+            
+            if not self.last_shutdown_time:
+                logger.info("首次启动，跳过宕机恢复")
                 return
             
-            channel = guild.get_channel(config[2])  # channel_id
-            if not channel:
-                logger.warning(f"找不到频道 ID: {config[2]}")
+            # 解析关闭时间
+            if isinstance(self.last_shutdown_time, str):
+                shutdown_time = datetime.fromisoformat(self.last_shutdown_time)
+            else:
+                shutdown_time = self.last_shutdown_time
+            
+            if shutdown_time.tzinfo is None:
+                shutdown_time = shutdown_time.replace(tzinfo=timezone.utc)
+            
+            # 计算宕机时长
+            downtime = self.startup_time - shutdown_time
+            
+            # 只有宕机超过5分钟才进行恢复
+            if downtime.total_seconds() < 300:
+                logger.info(f"宕机时间较短({downtime})，跳过恢复")
                 return
             
-            # 如果是帖子，获取帖子
-            if config[3]:  # thread_id
-                thread = channel.get_thread(config[3])
-                if thread:
-                    channel = thread
+            logger.info(f"检测到宕机，开始恢复，宕机时长: {downtime}")
+            
+            # 获取所有配置并并发恢复
+            configs = await self.db_manager.get_all_backup_configs()
+            if not configs:
+                logger.info("没有备份配置，跳过恢复")
+                return
+            
+            recovery_tasks = []
+            for config in configs:
+                task = asyncio.create_task(self.recover_single_config(config, shutdown_time))
+                recovery_tasks.append(task)
+            
+            # 等待所有恢复任务完成
+            if recovery_tasks:
+                results = await asyncio.gather(*recovery_tasks, return_exceptions=True)
+                success_count = sum(1 for r in results if not isinstance(r, Exception))
+                logger.info(f"宕机恢复完成: {success_count}/{len(configs)} 个配置恢复成功")
+            
+        except Exception as e:
+            logger.error(f"宕机恢复失败: {e}")
+    
+    async def recover_single_config(self, config, shutdown_time):
+        """恢复单个配置"""
+        try:
+            config_id, guild_id, channel_id, thread_id, author_id = config[:5]
+            
+            # 获取该配置的最后检查时间
+            last_check = await self.db_manager.get_latest_message_time(config_id)
+            
+            if last_check:
+                if isinstance(last_check, str):
+                    recovery_time = datetime.fromisoformat(last_check)
                 else:
-                    logger.warning(f"找不到帖子 ID: {config[3]}")
-                    return
+                    recovery_time = last_check
+                
+                if recovery_time.tzinfo is None:
+                    recovery_time = recovery_time.replace(tzinfo=timezone.utc)
+            else:
+                recovery_time = shutdown_time
             
-            # 扫描宕机期间的消息，从上次关闭时间开始
-            await self.message_handler.scan_channel_history(
-                channel, config[4], config[0], after_time=self.last_shutdown_time  # author_id, config_id
+            # 执行历史扫描
+            scanned, downloaded = await self.message_handler.scan_history(
+                guild_id, channel_id, thread_id, author_id, config_id, recovery_time
             )
             
-            logger.info(f"恢复配置 {config[0]} 完成")
+            if downloaded > 0:
+                logger.info(f"配置 {config_id} 恢复完成: 下载 {downloaded} 个文件")
+            
+            return True
             
         except Exception as e:
             logger.error(f"恢复配置 {config[0]} 失败: {e}")
+            return False
     
-    async def process_pending_scan_tasks(self):
-        """处理待处理的扫描任务"""
-        try:
-            tasks = await self.db_manager.get_pending_scan_tasks()
-            if not tasks:
-                logger.info("没有待处理的扫描任务")
-                return
-            
-            logger.info(f"发现 {len(tasks)} 个待处理的扫描任务")
-            
-            # 处理每个任务
-            for task in tasks:
-                await self.process_scan_task(task)
+    async def process_webhook_notifications(self):
+        """处理Webhook通知队列"""
+        webhook_server = get_webhook_server()
+        if not webhook_server:
+            logger.warning("Webhook服务器未找到，跳过通知处理")
+            return
+        
+        logger.info("开始处理Webhook通知")
+        
+        while self.webhook_processor_running:
+            try:
+                # 获取通知
+                notification = await webhook_server.get_notification()
+                if not notification:
+                    await asyncio.sleep(5)  # 没有通知时等待
+                    continue
                 
-        except Exception as e:
-            logger.error(f"处理扫描任务失败: {e}")
+                # 处理通知
+                await self.handle_webhook_notification(notification)
+                
+            except Exception as e:
+                logger.error(f"处理Webhook通知失败: {e}")
+                await asyncio.sleep(5)
     
-    async def process_scan_task(self, task):
-        """处理单个扫描任务"""
-        task_id = task[0]
-        config_id = task[1]
-        guild_id = task[2]
-        channel_id = task[3]
-        thread_id = task[4]
-        author_id = task[5]
-        work_title = task[6]
-        
+    async def handle_webhook_notification(self, notification):
+        """处理单个Webhook通知"""
         try:
-            logger.info(f"处理扫描任务 {task_id}: 服务器 {guild_id}, 频道 {channel_id}, 作者 {author_id}")
+            action = notification.get("action")
+            config_id = notification.get("config_id")
+            guild_id = notification.get("guild_id")
+            channel_id = notification.get("channel_id")
+            thread_id = notification.get("thread_id")
+            author_id = notification.get("author_id")
             
-            # 更新任务状态为进行中
-            await self.db_manager.update_scan_task_status(task_id, 'in_progress')
+            logger.info(f"处理Webhook通知: {action} 配置 {config_id}")
             
-            # 获取服务器和频道
-            guild = self.get_guild(guild_id)
-            if not guild:
-                raise Exception(f"找不到服务器 {guild_id}")
-            
-            channel = guild.get_channel(channel_id)
-            if not channel:
-                raise Exception(f"找不到频道 {channel_id}")
-            
-            # 如果是帖子，获取帖子
-            if thread_id:
-                thread = channel.get_thread(thread_id)
-                if thread:
-                    channel = thread
-                else:
-                    raise Exception(f"找不到帖子 {thread_id}")
-            
-            # 执行历史扫描
-            scanned, backed_up = await self.message_handler.scan_channel_history(
-                channel, author_id, config_id, limit=self.config.max_scan_messages
-            )
-            
-            # 更新任务状态为完成
-            await self.db_manager.update_scan_task_status(task_id, 'completed')
-            
-            logger.info(f"扫描任务 {task_id} 完成: 扫描 {scanned} 条消息, 备份 {backed_up} 条消息")
+            if action == "enable":
+                # 发送开启通知
+                await self.message_handler.send_notification_card(
+                    guild_id, channel_id, thread_id, author_id, "enable"
+                )
+                
+                # 执行历史扫描
+                scanned, downloaded = await self.message_handler.scan_history(
+                    guild_id, channel_id, thread_id, author_id, config_id
+                )
+                
+                logger.info(f"备份启用完成: 配置 {config_id}, 扫描 {scanned} 条, 下载 {downloaded} 个文件")
+                
+            elif action == "disable":
+                # 发送暂停通知
+                await self.message_handler.send_notification_card(
+                    guild_id, channel_id, thread_id, author_id, "disable"
+                )
+                
+                logger.info(f"备份暂停完成: 配置 {config_id}")
             
         except Exception as e:
-            logger.error(f"处理扫描任务 {task_id} 失败: {e}")
-            await self.db_manager.update_scan_task_status(task_id, 'failed', str(e))
-    
-    def start_periodic_scan_task_processing(self):
-        """启动定期扫描任务处理"""
-        async def periodic_processor():
-            while True:
-                try:
-                    await asyncio.sleep(60)  # 每分钟检查一次
-                    await self.process_pending_scan_tasks()
-                except Exception as e:
-                    logger.error(f"定期扫描任务处理失败: {e}")
-        
-        # 创建后台任务
-        asyncio.create_task(periodic_processor())
-        logger.info("已启动定期扫描任务处理")
+            logger.error(f"处理Webhook通知失败: {e}")
     
     async def on_message(self, message):
         """处理消息事件"""
@@ -260,12 +255,27 @@ class DiscordBot(commands.Bot):
         # 处理命令
         await self.process_commands(message)
     
-    
     async def on_error(self, event, *args, **kwargs):
         """处理错误事件"""
         import traceback
         logger.error(f"发生错误 - 事件: {event}")
         logger.error(traceback.format_exc())
+    
+    async def on_disconnect(self):
+        """当Bot断开连接时"""
+        logger.warning("Bot与Discord断开连接")
+    
+    async def on_connect(self):
+        """当Bot连接到Discord时"""
+        logger.info("Bot已连接到Discord")
+        # 重置重连计数
+        self.reconnect_manager.reset_retry_count()
+    
+    async def on_resumed(self):
+        """当Bot恢复连接时"""
+        logger.info("Bot已恢复连接到Discord")
+        # 重置重连计数
+        self.reconnect_manager.reset_retry_count()
     
     async def on_command_error(self, ctx, error):
         """处理命令错误"""
@@ -283,12 +293,15 @@ class DiscordBot(commands.Bot):
     async def close(self):
         """关闭Bot"""
         logger.info("Bot正在关闭...")
-        self.last_shutdown_time = datetime.now()
         
-        # 保存关闭时间到数据库
+        # 停止Webhook处理
+        self.webhook_processor_running = False
+        
+        # 保存关闭时间
+        shutdown_time = datetime.now(timezone.utc)
         try:
-            await self.db_manager.save_shutdown_time(self.last_shutdown_time)
-            logger.info(f"已保存关闭时间: {self.last_shutdown_time}")
+            await self.db_manager.save_shutdown_time(shutdown_time)
+            logger.info(f"已保存关闭时间: {shutdown_time}")
         except Exception as e:
             logger.error(f"保存关闭时间失败: {e}")
         
@@ -300,4 +313,4 @@ class DiscordBot(commands.Bot):
             self.run(self.config.token)
         except Exception as e:
             logger.error(f"Bot运行失败: {e}")
-            raise 
+            raise

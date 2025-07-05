@@ -79,4 +79,25 @@ class Config:
     
     @property
     def webhook_enabled(self):
-        return self.getboolean('webhook', 'enabled', fallback=True) 
+        return self.getboolean('webhook', 'enabled', fallback=True)
+    
+    # 网络设置
+    @property
+    def max_retries(self):
+        return self.getint('network', 'max_retries', fallback=10)
+    
+    @property
+    def base_retry_delay(self):
+        return self.getint('network', 'base_retry_delay', fallback=5)
+    
+    @property
+    def enable_diagnostics(self):
+        return self.getboolean('network', 'enable_diagnostics', fallback=True)
+    
+    @property
+    def connection_timeout(self):
+        return self.getint('network', 'connection_timeout', fallback=60)
+    
+    @property
+    def read_timeout(self):
+        return self.getint('network', 'read_timeout', fallback=30) 

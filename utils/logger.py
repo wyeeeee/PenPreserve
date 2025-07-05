@@ -46,6 +46,15 @@ def setup_logging(config):
     discord_logger = logging.getLogger('discord')
     discord_logger.setLevel(logging.WARNING)
     
+    # 创建过滤器来屏蔽PyNaCl警告
+    class PyNaClFilter(logging.Filter):
+        def filter(self, record):
+            return 'PyNaCl is not installed' not in record.getMessage()
+    
+    # 应用过滤器到discord.client日志器
+    discord_client_logger = logging.getLogger('discord.client')
+    discord_client_logger.addFilter(PyNaClFilter())
+    
     # 设置aiosqlite的日志级别
     aiosqlite_logger = logging.getLogger('aiosqlite')
     aiosqlite_logger.setLevel(logging.WARNING)

@@ -17,37 +17,13 @@ sys.path.insert(0, str(project_root))
 
 from config.settings import Config
 from core.bot import DiscordBot
-from server.webhook_server import WebhookServer
+from server.webhook_server import WebhookServer, set_webhook_server
 from utils.logger import setup_logging
-
-async def run_bot_only(config):
-    """仅运行Discord Bot"""
-    logger = logging.getLogger(__name__)
-    logger.info("启动Discord Bot...")
-    
-    bot = DiscordBot(config)
-    
-    # 设置信号处理
-    def signal_handler(signum, frame):
-        logger.info(f"收到信号 {signum}，正在优雅关闭...")
-        asyncio.create_task(bot.close())
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    try:
-        await bot.start(config.token)
-    except Exception as e:
-        logger.error(f"Discord Bot运行失败: {e}")
-        raise
-    finally:
-        if not bot.is_closed():
-            await bot.close()
 
 async def run_with_webhook(config):
     """同时运行Discord Bot和Webhook服务器"""
     logger = logging.getLogger(__name__)
-    logger.info("启动完整服务（Bot + Webhook）...")
+    logger.info("启动PenPreserve v2.0...")
     
     # 创建任务列表
     tasks = []
@@ -55,19 +31,12 @@ async def run_with_webhook(config):
     # 创建Discord Bot
     bot = DiscordBot(config)
     
-    # Discord Bot任务
-    async def run_discord_bot():
-        try:
-            await bot.start(config.token)
-        except Exception as e:
-            logger.error(f"Discord Bot运行失败: {e}")
-            raise
-    
-    tasks.append(asyncio.create_task(run_discord_bot()))
-    
-    # 如果启用了webhook，创建webhook服务器
+    # 如果启用了webhook，先创建并设置webhook服务器
+    webhook_server = None
     if config.webhook_enabled:
         webhook_server = WebhookServer(config)
+        set_webhook_server(webhook_server)  # 设置全局实例
+        logger.info(f"Webhook服务器将在 {config.webhook_host}:{config.webhook_port} 启动")
         
         # Webhook服务器任务
         async def run_webhook_server():
@@ -78,9 +47,18 @@ async def run_with_webhook(config):
                 raise
         
         tasks.append(asyncio.create_task(run_webhook_server()))
-        logger.info(f"Webhook服务器将在 {config.webhook_host}:{config.webhook_port} 启动")
     else:
         logger.info("Webhook服务器已禁用")
+    
+    # Discord Bot任务（使用重连管理器）
+    async def run_discord_bot():
+        try:
+            await bot.reconnect_manager.run_with_reconnect()
+        except Exception as e:
+            logger.error(f"Discord Bot运行失败: {e}")
+            raise
+    
+    tasks.append(asyncio.create_task(run_discord_bot()))
     
     # 设置信号处理
     def signal_handler(signum, frame):
@@ -104,7 +82,6 @@ async def run_with_webhook(config):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='PenPreserve Discord备份机器人')
-    parser.add_argument('--webhook', action='store_true', help='同时启动Webhook服务器')
     parser.add_argument('--config', default='config/bot_config.cfg', help='配置文件路径')
     
     args = parser.parse_args()
@@ -121,11 +98,8 @@ def main():
         logger = logging.getLogger(__name__)
         logger.info("配置加载完成，开始启动服务...")
         
-        # 根据参数选择运行模式
-        if args.webhook:
-            asyncio.run(run_with_webhook(config))
-        else:
-            asyncio.run(run_bot_only(config))
+        # 直接运行完整服务（Bot + Webhook根据配置决定）
+        asyncio.run(run_with_webhook(config))
         
     except FileNotFoundError as e:
         print(f"错误: {e}")
