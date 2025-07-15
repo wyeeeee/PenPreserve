@@ -66,6 +66,27 @@ class MessageHandler:
         except Exception as e:
             logger.error(f"处理消息失败: {e}")
     
+    async def backup_message(self, message: discord.Message, config_id: int) -> bool:
+        """手动备份单个消息，返回成功状态"""
+        try:
+            # 确定内容类型
+            if isinstance(message.channel, discord.Thread):
+                content_type = "thread"
+            else:
+                content_type = "channel"
+            
+            # 调用备份处理函数
+            result = await self.process_message_backup(message, config_id, content_type)
+            
+            # 更新最后活动时间
+            await self.db_manager.update_last_activity_time(datetime.now(timezone.utc))
+            
+            return result is not False  # 如果没有明确返回 False，则认为成功
+            
+        except Exception as e:
+            logger.error(f"手动备份消息失败: {e}")
+            return False
+    
     async def process_message_backup(self, message: discord.Message, config_id: int, content_type: str):
         """处理消息备份"""
         try:
@@ -86,7 +107,7 @@ class MessageHandler:
             
             if not message_backup_id:
                 logger.error(f"保存消息备份失败: {message.id}")
-                return
+                return False
             
             # 处理附件
             if message.attachments:
@@ -103,8 +124,11 @@ class MessageHandler:
             else:
                 logger.debug(f"消息 {message.id} 无附件，仅保存文本")
             
+            return True  # 备份成功
+            
         except Exception as e:
             logger.error(f"处理消息备份失败: {e}")
+            return False
     
     async def process_attachment(self, attachment, message_backup_id: int, guild_id: int, author_id: int, 
                                thread_id: int, message_timestamp: datetime) -> bool:

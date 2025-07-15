@@ -250,6 +250,14 @@ class DatabaseManager:
             ''', (message_id,))
             return await cursor.fetchone()
     
+    async def get_message_backup(self, config_id: int, message_id: int) -> Optional[Tuple]:
+        """根据配置 ID 和消息 ID 获取消息备份"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute('''
+                SELECT * FROM message_backups WHERE config_id = ? AND message_id = ?
+            ''', (config_id, message_id))
+            return await cursor.fetchone()
+    
     async def get_latest_message_time(self, config_id: int) -> Optional[str]:
         """获取配置的最新消息时间"""
         async with aiosqlite.connect(self.db_path) as db:

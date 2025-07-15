@@ -27,6 +27,12 @@ class BackupCommands(commands.Cog):
         # 创建备份操作实例
         self.backup_ops = BackupOperations(bot, self.db_manager, self.message_handler)
     
+    def is_thread_owner(self, interaction: discord.Interaction) -> bool:
+        """检查用户是否为线程所有者"""
+        if not isinstance(interaction.channel, discord.Thread):
+            return False
+        return interaction.channel.owner_id == interaction.user.id
+    
     @app_commands.command(name="备份状态", description="查看当前频道/帖子的备份状态")
     async def backup_status(self, interaction: discord.Interaction):
         """查看当前频道/帖子的备份状态"""
@@ -210,14 +216,24 @@ class BackupCommands(commands.Cog):
             logger.error(f"查看我的备份失败: {e}")
             await interaction.followup.send("查看备份列表时发生错误", ephemeral=True)
     
-    @app_commands.command(name="启用备份", description="手动启用当前位置的备份功能（备用选项）")
+    @app_commands.command(name="启用备份", description="手动启用当前位置的备份功能（仅限楼主）")
     async def enable_backup(self, interaction: discord.Interaction):
-        """手动启用备份功能"""
+        """手动启用备份功能（仅限楼主）"""
         try:
             await interaction.response.defer()
             
             # 确定位置信息
             if isinstance(interaction.channel, discord.Thread):
+                # 检查是否为线程所有者
+                if not self.is_thread_owner(interaction):
+                    embed = discord.Embed(
+                        title="⚠️ 权限不足",
+                        description="只有线程所有者（楼主）才能手动启用备份功能",
+                        color=discord.Color.red()
+                    )
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    return
+                
                 thread_id = interaction.channel.id
                 channel_id = interaction.channel.parent.id
                 location_type = "帖子"
@@ -462,6 +478,141 @@ class BackupCommands(commands.Cog):
         except Exception as e:
             logger.error(f"查看系统状态失败: {e}")
             await interaction.followup.send("查看系统状态时发生错误", ephemeral=True)
+    
+    @app_commands.command(name="手动备份", description="手动备份指定消息（仅限楼主）")
+    @app_commands.describe(message_id="要备份的消息 ID")
+    async def manual_backup(self, interaction: discord.Interaction, message_id: str):
+        """手动备份指定消息（仅限楼主）"""
+        try:
+            await interaction.response.defer()
+            
+            # 检查是否在线程中并且是楼主
+            if not isinstance(interaction.channel, discord.Thread):
+                embed = discord.Embed(
+                    title="⚠️ 仅限线程使用",
+                    description="手动备份命令只能在线程中使用",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            
+            if not self.is_thread_owner(interaction):
+                embed = discord.Embed(
+                    title="⚠️ 权限不足",
+                    description="只有线程所有者（楼主）才能使用手动备份功能",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            
+            # 转换消息 ID
+            try:
+                msg_id = int(message_id)
+            except ValueError:
+                embed = discord.Embed(
+                    title="⚠️ 参数错误",
+                    description="请提供有效的消息 ID",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            
+            # 获取消息
+            try:
+                message = await interaction.channel.fetch_message(msg_id)
+            except discord.NotFound:
+                embed = discord.Embed(
+                    title="⚠️ 消息未找到",
+                    description="在当前线程中找不到指定的消息",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            except discord.Forbidden:
+                embed = discord.Embed(
+                    title="⚠️ 权限不足",
+                    description="无法访问该消息",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            
+            # 检查消息作者是否为线程所有者
+            if message.author.id != interaction.user.id:
+                embed = discord.Embed(
+                    title="⚠️ 权限不足",
+                    description="只能备份您自己发送的消息",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            
+            # 检查是否有备份配置
+            thread_id = interaction.channel.id
+            channel_id = interaction.channel.parent.id
+            backup_config = await self.db_manager.get_backup_config(
+                interaction.guild.id, channel_id, thread_id, interaction.user.id
+            )
+            
+            if not backup_config:
+                embed = discord.Embed(
+                    title="⚠️ 未启用备份",
+                    description="请先使用 `/启用备份` 命令启用备份功能",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            
+            config_id = backup_config[0]
+            
+            # 检查消息是否已经备份
+            existing_backup = await self.db_manager.get_message_backup(config_id, msg_id)
+            if existing_backup:
+                embed = discord.Embed(
+                    title="⚠️ 已经备份",
+                    description="该消息已经备份过了",
+                    color=discord.Color.orange()
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+            
+            # 执行手动备份
+            try:
+                success = await self.message_handler.backup_message(message, config_id)
+                if success:
+                    embed = discord.Embed(
+                        title="✅ 备份成功",
+                        description=f"已成功备份消息: {message.content[:100]}{'...' if len(message.content) > 100 else ''}",
+                        color=discord.Color.green(),
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    if message.attachments:
+                        embed.add_field(
+                            name="附件信息",
+                            value=f"备份了 {len(message.attachments)} 个附件",
+                            inline=False
+                        )
+                else:
+                    embed = discord.Embed(
+                        title="⚠️ 备份失败",
+                        description="备份消息时发生错误",
+                        color=discord.Color.red()
+                    )
+                
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                
+            except Exception as e:
+                logger.error(f"手动备份消息失败: {e}")
+                embed = discord.Embed(
+                    title="⚠️ 备份失败",
+                    description="备份消息时发生错误",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            logger.error(f"手动备份命令失败: {e}")
+            await interaction.followup.send("手动备份命令执行失败", ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(BackupCommands(bot))
