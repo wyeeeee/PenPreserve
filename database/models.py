@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+增强的数据库模型
+支持消息备份、WebDAV文件存储、扩展的用户管理功能
+"""
+
 import aiosqlite
 import logging
 from datetime import datetime, timezone
@@ -15,7 +21,7 @@ class DatabaseManager:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         
         async with aiosqlite.connect(self.db_path) as db:
-            # 备份配置表 - 核心配置信息
+            # 备份配置表
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS backup_configs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,6 +29,7 @@ class DatabaseManager:
                     channel_id INTEGER NOT NULL,
                     thread_id INTEGER DEFAULT NULL,
                     author_id INTEGER NOT NULL,
+                    title TEXT DEFAULT NULL,
                     enabled BOOLEAN DEFAULT TRUE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_check_time TIMESTAMP DEFAULT NULL,
@@ -30,57 +37,84 @@ class DatabaseManager:
                 )
             ''')
             
-            # 内容记录表 - 记录帖子/频道的基本信息
+            # 检查并添加 title 字段到 backup_configs 表
+            try:
+                # 先检查字段是否存在
+                cursor = await db.execute("PRAGMA table_info(backup_configs)")
+                columns = await cursor.fetchall()
+                column_names = [column[1] for column in columns]
+                
+                if 'title' not in column_names:
+                    self.logger.info("添加 title 字段到 backup_configs 表")
+                    await db.execute('ALTER TABLE backup_configs ADD COLUMN title TEXT DEFAULT NULL')
+                    await db.commit()
+            except Exception as e:
+                self.logger.debug(f"检查/添加title字段时的错误（可能是表不存在）: {e}")
+            
+            # 检查并添加 last_activity_time 字段到 bot_status 表
+            try:
+                # 先检查字段是否存在
+                cursor = await db.execute("PRAGMA table_info(bot_status)")
+                columns = await cursor.fetchall()
+                column_names = [column[1] for column in columns]
+                
+                if 'last_activity_time' not in column_names:
+                    self.logger.info("添加 last_activity_time 字段到 bot_status 表")
+                    await db.execute('ALTER TABLE bot_status ADD COLUMN last_activity_time TIMESTAMP')
+                    await db.commit()
+            except Exception as e:
+                self.logger.debug(f"检查/添加字段时的错误（可能是表不存在）: {e}")
+            
+            # 消息备份表
             await db.execute('''
-                CREATE TABLE IF NOT EXISTS content_records (
+                CREATE TABLE IF NOT EXISTS message_backups (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     config_id INTEGER NOT NULL,
-                    content_type TEXT NOT NULL, -- 'thread' 或 'channel'
-                    title TEXT,
-                    first_post_content TEXT,
-                    author_name TEXT NOT NULL,
-                    author_display_name TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    message_id INTEGER NOT NULL UNIQUE,
+                    content TEXT DEFAULT '',
+                    created_at TIMESTAMP NOT NULL,
+                    backup_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    content_type TEXT NOT NULL DEFAULT 'channel',
                     FOREIGN KEY (config_id) REFERENCES backup_configs (id)
                 )
             ''')
             
-            # 文件下载记录表 - 记录所有下载的附件
+            # 文件备份表（支持WebDAV）
             await db.execute('''
-                CREATE TABLE IF NOT EXISTS file_downloads (
+                CREATE TABLE IF NOT EXISTS file_backups (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    config_id INTEGER NOT NULL,
-                    message_id INTEGER NOT NULL,
+                    message_backup_id INTEGER NOT NULL,
                     original_filename TEXT NOT NULL,
-                    saved_filename TEXT NOT NULL,
-                    file_path TEXT NOT NULL,
+                    stored_filename TEXT NOT NULL,
                     file_size INTEGER NOT NULL,
-                    download_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (config_id) REFERENCES backup_configs (id)
+                    file_url TEXT,
+                    webdav_path TEXT,
+                    backup_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (message_backup_id) REFERENCES message_backups (id)
                 )
             ''')
             
-            # Bot状态表 - 记录启动关闭时间用于宕机恢复
+            # Bot状态表（仅保留活动时间）
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS bot_status (
                     id INTEGER PRIMARY KEY,
-                    last_shutdown_time TIMESTAMP,
-                    last_startup_time TIMESTAMP
+                    last_activity_time TIMESTAMP
                 )
             ''')
             
             # 创建索引
             await db.execute('CREATE INDEX IF NOT EXISTS idx_backup_configs_location ON backup_configs(guild_id, channel_id, thread_id)')
             await db.execute('CREATE INDEX IF NOT EXISTS idx_backup_configs_author ON backup_configs(author_id)')
-            await db.execute('CREATE INDEX IF NOT EXISTS idx_file_downloads_config ON file_downloads(config_id)')
-            await db.execute('CREATE INDEX IF NOT EXISTS idx_file_downloads_message ON file_downloads(message_id)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_message_backups_config ON message_backups(config_id)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_message_backups_message ON message_backups(message_id)')
+            await db.execute('CREATE INDEX IF NOT EXISTS idx_file_backups_message ON file_backups(message_backup_id)')
             
             await db.commit()
             self.logger.info("数据库初始化完成")
     
     # ========== 备份配置管理 ==========
     
-    async def create_backup_config(self, guild_id: int, channel_id: int, thread_id: Optional[int], author_id: int) -> Optional[int]:
+    async def create_backup_config(self, guild_id: int, channel_id: int, thread_id: Optional[int], author_id: int, title: str = None) -> Optional[int]:
         """创建备份配置"""
         async with aiosqlite.connect(self.db_path) as db:
             try:
@@ -97,27 +131,27 @@ class DatabaseManager:
                     config_id, enabled = existing
                     if enabled:
                         self.logger.warning(f"备份配置已存在且启用: ID {config_id}")
-                        return None
+                        return config_id
                     else:
-                        # 重新启用已禁用的配置
+                        # 重新启用已禁用的配置，同时更新标题
                         await db.execute('''
-                            UPDATE backup_configs SET enabled = TRUE, created_at = CURRENT_TIMESTAMP 
+                            UPDATE backup_configs SET enabled = TRUE, created_at = CURRENT_TIMESTAMP, title = ?
                             WHERE id = ?
-                        ''', (config_id,))
+                        ''', (title, config_id))
                         await db.commit()
                         self.logger.info(f"重新启用备份配置: ID {config_id}")
                         return config_id
                 else:
                     # 创建新配置
                     await db.execute('''
-                        INSERT INTO backup_configs (guild_id, channel_id, thread_id, author_id)
-                        VALUES (?, ?, ?, ?)
-                    ''', (guild_id, channel_id, thread_id, author_id))
+                        INSERT INTO backup_configs (guild_id, channel_id, thread_id, author_id, title)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (guild_id, channel_id, thread_id, author_id, title))
                     await db.commit()
                     
                     cursor = await db.execute('SELECT last_insert_rowid()')
                     config_id = (await cursor.fetchone())[0]
-                    self.logger.info(f"创建新备份配置: ID {config_id}")
+                    self.logger.info(f"创建新备份配置: ID {config_id}, 标题: {title}")
                     return config_id
                     
             except Exception as e:
@@ -148,7 +182,15 @@ class DatabaseManager:
             cursor = await db.execute('SELECT * FROM backup_configs WHERE enabled = TRUE')
             return await cursor.fetchall()
     
-    async def update_config_check_time(self, config_id: int):
+    async def get_user_backup_configs(self, author_id: int) -> List[Tuple]:
+        """获取用户的所有备份配置"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute('''
+                SELECT * FROM backup_configs WHERE author_id = ? AND enabled = TRUE
+            ''', (author_id,))
+            return await cursor.fetchall()
+    
+    async def update_backup_config_check_time(self, config_id: int):
         """更新配置的最后检查时间"""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute('''
@@ -156,175 +198,179 @@ class DatabaseManager:
             ''', (config_id,))
             await db.commit()
     
-    # ========== 内容记录管理 ==========
-    
-    async def save_content_record(self, config_id: int, content_type: str, title: str, 
-                                first_post_content: Optional[str], author_name: str, 
-                                author_display_name: str) -> int:
-        """保存内容记录"""
+    async def update_backup_config_title(self, config_id: int, title: str):
+        """更新备份配置的标题"""
         async with aiosqlite.connect(self.db_path) as db:
-            # 先删除已存在的记录
-            await db.execute('DELETE FROM content_records WHERE config_id = ?', (config_id,))
-            
-            # 插入新记录
-            await db.execute('''
-                INSERT INTO content_records 
-                (config_id, content_type, title, first_post_content, author_name, author_display_name)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (config_id, content_type, title, first_post_content, author_name, author_display_name))
-            await db.commit()
-            
-            cursor = await db.execute('SELECT last_insert_rowid()')
-            record_id = (await cursor.fetchone())[0]
-            self.logger.info(f"保存内容记录: ID {record_id}, 类型 {content_type}, 标题 {title}")
-            return record_id
+            try:
+                await db.execute('''
+                    UPDATE backup_configs SET title = ? WHERE id = ?
+                ''', (title, config_id))
+                await db.commit()
+                self.logger.debug(f"更新配置标题: {config_id} -> {title}")
+            except Exception as e:
+                self.logger.error(f"更新配置标题失败: {e}")
     
-    async def get_content_record(self, config_id: int) -> Optional[Tuple]:
-        """获取内容记录"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('SELECT * FROM content_records WHERE config_id = ?', (config_id,))
-            return await cursor.fetchone()
-    
-    # ========== 文件下载管理 ==========
-    
-    async def record_file_download(self, config_id: int, message_id: int, original_filename: str,
-                                 saved_filename: str, file_path: str, file_size: int) -> int:
-        """记录文件下载"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute('''
-                INSERT INTO file_downloads 
-                (config_id, message_id, original_filename, saved_filename, file_path, file_size)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (config_id, message_id, original_filename, saved_filename, file_path, file_size))
-            await db.commit()
-            
-            cursor = await db.execute('SELECT last_insert_rowid()')
-            download_id = (await cursor.fetchone())[0]
-            self.logger.debug(f"记录文件下载: {saved_filename} ({file_size} bytes)")
-            return download_id
-    
-    async def get_downloaded_files(self, config_id: int) -> List[Tuple]:
-        """获取已下载的文件列表"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('''
-                SELECT * FROM file_downloads WHERE config_id = ? ORDER BY download_time DESC
-            ''', (config_id,))
-            return await cursor.fetchall()
-    
-    async def is_file_downloaded(self, message_id: int, original_filename: str) -> bool:
-        """检查文件是否已下载"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('''
-                SELECT id FROM file_downloads 
-                WHERE message_id = ? AND original_filename = ?
-            ''', (message_id, original_filename))
-            result = await cursor.fetchone()
-            return result is not None
-    
-    # ========== 宕机恢复相关 ==========
-    
-    async def get_latest_message_time(self, config_id: int) -> Optional[str]:
-        """获取配置的最后检查时间（用于宕机恢复）"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('''
-                SELECT last_check_time FROM backup_configs WHERE id = ?
-            ''', (config_id,))
-            result = await cursor.fetchone()
-            return result[0] if result and result[0] else None
-    
-    async def save_startup_time(self, startup_time: datetime):
-        """保存启动时间"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute('''
-                INSERT OR REPLACE INTO bot_status (id, last_startup_time) 
-                VALUES (1, ?)
-            ''', (startup_time,))
-            await db.commit()
-            self.logger.info(f"保存启动时间: {startup_time}")
-    
-    async def save_shutdown_time(self, shutdown_time: datetime):
-        """保存关闭时间"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute('''
-                INSERT OR REPLACE INTO bot_status (id, last_shutdown_time) 
-                VALUES (1, ?)
-            ''', (shutdown_time,))
-            await db.commit()
-            self.logger.info(f"保存关闭时间: {shutdown_time}")
-    
-    async def get_last_shutdown_time(self) -> Optional[str]:
-        """获取最后关闭时间"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('SELECT last_shutdown_time FROM bot_status WHERE id = 1')
-            result = await cursor.fetchone()
-            return result[0] if result and result[0] else None
-    
-    # ========== 统计查询 ==========
-    
-    async def get_backup_stats(self, config_id: int) -> dict:
-        """获取备份统计信息"""
-        async with aiosqlite.connect(self.db_path) as db:
-            # 文件数量
-            cursor = await db.execute('''
-                SELECT COUNT(*) FROM file_downloads WHERE config_id = ?
-            ''', (config_id,))
-            file_count = (await cursor.fetchone())[0]
-            
-            # 总文件大小
-            cursor = await db.execute('''
-                SELECT SUM(file_size) FROM file_downloads WHERE config_id = ?
-            ''', (config_id,))
-            total_size = (await cursor.fetchone())[0] or 0
-            
-            return {
-                'file_count': file_count,
-                'total_size': total_size
-            }
-    
-    # ========== 新增管理命令支持方法 ==========
-    
-    async def get_total_file_count(self) -> int:
-        """获取总文件数量"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('SELECT COUNT(*) FROM file_downloads')
-            return (await cursor.fetchone())[0]
-    
-    async def get_config_file_count(self, config_id: int) -> int:
-        """获取指定配置的文件数量"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('''
-                SELECT COUNT(*) FROM file_downloads WHERE config_id = ?
-            ''', (config_id,))
-            return (await cursor.fetchone())[0]
-    
-    async def get_user_backup_configs(self, author_id: int) -> List[Tuple]:
-        """获取用户的所有备份配置"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('''
-                SELECT * FROM backup_configs WHERE author_id = ? AND enabled = TRUE
-                ORDER BY created_at DESC
-            ''', (author_id,))
-            return await cursor.fetchall()
-    
-    async def get_total_config_count(self) -> int:
-        """获取总配置数量"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('SELECT COUNT(*) FROM backup_configs WHERE enabled = TRUE')
-            return (await cursor.fetchone())[0]
-    
-    async def get_total_record_count(self) -> int:
-        """获取总内容记录数量"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('SELECT COUNT(*) FROM content_records')
-            return (await cursor.fetchone())[0]
-    
-    async def get_recent_active_configs(self, limit: int = 5) -> List[Tuple]:
-        """获取最近活跃的配置"""
+    async def get_backup_config_by_location(self, guild_id: int, channel_id: int, thread_id: Optional[int]) -> List[Tuple]:
+        """根据位置获取所有备份配置（用于标题更新）"""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute('''
                 SELECT * FROM backup_configs 
-                WHERE enabled = TRUE AND last_check_time IS NOT NULL
-                ORDER BY last_check_time DESC 
-                LIMIT ?
-            ''', (limit,))
+                WHERE guild_id = ? AND channel_id = ? AND 
+                      (thread_id = ? OR (thread_id IS NULL AND ? IS NULL)) AND enabled = TRUE
+            ''', (guild_id, channel_id, thread_id, thread_id))
             return await cursor.fetchall()
+    
+    # ========== 消息备份管理 ==========
+    
+    async def save_message_backup(self, config_id: int, message_id: int, content: str, 
+                                created_at: datetime, content_type: str = 'channel') -> Optional[int]:
+        """保存消息备份"""
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                await db.execute('''
+                    INSERT INTO message_backups 
+                    (config_id, message_id, content, created_at, content_type)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (config_id, message_id, content, created_at.isoformat(), content_type))
+                await db.commit()
+                
+                cursor = await db.execute('SELECT last_insert_rowid()')
+                backup_id = (await cursor.fetchone())[0]
+                return backup_id
+                
+            except Exception as e:
+                self.logger.error(f"保存消息备份失败: {e}")
+                return None
+    
+    async def get_message_backup_by_message_id(self, message_id: int) -> Optional[Tuple]:
+        """根据消息ID获取消息备份"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute('''
+                SELECT * FROM message_backups WHERE message_id = ?
+            ''', (message_id,))
+            return await cursor.fetchone()
+    
+    async def get_latest_message_time(self, config_id: int) -> Optional[str]:
+        """获取配置的最新消息时间"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute('''
+                SELECT MAX(created_at) FROM message_backups WHERE config_id = ?
+            ''', (config_id,))
+            result = await cursor.fetchone()
+            return result[0] if result and result[0] else None
+    
+    # ========== 文件备份管理 ==========
+    
+    async def save_file_backup(self, message_backup_id: int, original_filename: str, 
+                             stored_filename: str, file_size: int, file_url: str, 
+                             webdav_path: str) -> Optional[int]:
+        """保存文件备份记录"""
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                await db.execute('''
+                    INSERT INTO file_backups 
+                    (message_backup_id, original_filename, stored_filename, file_size, file_url, webdav_path)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (message_backup_id, original_filename, stored_filename, file_size, file_url, webdav_path))
+                await db.commit()
+                
+                cursor = await db.execute('SELECT last_insert_rowid()')
+                backup_id = (await cursor.fetchone())[0]
+                return backup_id
+                
+            except Exception as e:
+                self.logger.error(f"保存文件备份失败: {e}")
+                return None
+    
+    async def get_files_by_config(self, config_id: int) -> List[Tuple]:
+        """获取配置的所有文件"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute('''
+                SELECT fb.* FROM file_backups fb
+                JOIN message_backups mb ON fb.message_backup_id = mb.id
+                WHERE mb.config_id = ?
+                ORDER BY fb.backup_time DESC
+            ''', (config_id,))
+            return await cursor.fetchall()
+    
+    
+    # ========== Bot状态管理 ==========
+    
+    
+    async def update_last_activity_time(self, activity_time: datetime):
+        """更新最后活动时间（每次处理消息时调用）"""
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                await db.execute('''
+                    INSERT OR REPLACE INTO bot_status (id, last_activity_time)
+                    VALUES (1, ?)
+                ''', (activity_time.isoformat(),))
+                await db.commit()
+            except Exception as e:
+                self.logger.warning(f"更新最后活动时间失败: {e}")
+                # 如果字段不存在，尝试添加字段后重试
+                try:
+                    await db.execute('ALTER TABLE bot_status ADD COLUMN last_activity_time TIMESTAMP')
+                    await db.execute('''
+                        INSERT OR REPLACE INTO bot_status (id, last_activity_time)
+                        VALUES (1, ?)
+                    ''', (activity_time.isoformat(),))
+                    await db.commit()
+                    self.logger.info("成功添加字段并更新活动时间")
+                except Exception as e2:
+                    self.logger.error(f"重试更新活动时间失败: {e2}")
+    
+    async def get_last_activity_time(self) -> Optional[str]:
+        """获取最后活动时间"""
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                cursor = await db.execute('SELECT last_activity_time FROM bot_status WHERE id = 1')
+                result = await cursor.fetchone()
+                return result[0] if result and result[0] else None
+            except Exception as e:
+                self.logger.warning(f"获取最后活动时间失败: {e}")
+                return None
+    
+    
+    # ========== 统计信息 ==========
+    
+    async def get_backup_stats(self, config_id: Optional[int] = None) -> dict:
+        """获取备份统计信息"""
+        async with aiosqlite.connect(self.db_path) as db:
+            if config_id:
+                # 特定配置的统计
+                cursor = await db.execute('''
+                    SELECT COUNT(*) FROM message_backups WHERE config_id = ?
+                ''', (config_id,))
+                message_count = (await cursor.fetchone())[0]
+                
+                cursor = await db.execute('''
+                    SELECT COUNT(*), COALESCE(SUM(fb.file_size), 0) 
+                    FROM file_backups fb
+                    JOIN message_backups mb ON fb.message_backup_id = mb.id
+                    WHERE mb.config_id = ?
+                ''', (config_id,))
+                file_count, total_size = await cursor.fetchone()
+                
+                return {
+                    'message_count': message_count,
+                    'file_count': file_count or 0,
+                    'total_size': total_size or 0
+                }
+            else:
+                # 全局统计
+                cursor = await db.execute('SELECT COUNT(*) FROM message_backups')
+                message_count = (await cursor.fetchone())[0]
+                
+                cursor = await db.execute('SELECT COUNT(*), COALESCE(SUM(file_size), 0) FROM file_backups')
+                file_count, total_size = await cursor.fetchone()
+                
+                cursor = await db.execute('SELECT COUNT(*) FROM backup_configs WHERE enabled = TRUE')
+                config_count = (await cursor.fetchone())[0]
+                
+                return {
+                    'config_count': config_count,
+                    'message_count': message_count,
+                    'file_count': file_count or 0,
+                    'total_size': total_size or 0
+                }

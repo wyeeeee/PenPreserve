@@ -5,7 +5,9 @@
       "Bash(mv:*)",
       "Bash(true)",
       "Bash(rm:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(move backup_commands.py backup_commands_old.py)",
+      "Bash(move backup_commands_new.py backup_commands.py)"
     ],
     "deny": []
   }

@@ -35,6 +35,7 @@ class DiscordBot(commands.Bot):
         self.startup_time = None
         self.last_shutdown_time = None
         self.webhook_processor_running = False
+        self._shutdown_in_progress = False
         
         # 重连管理器
         self.reconnect_manager = ReconnectManager(self)
@@ -64,11 +65,11 @@ class DiscordBot(commands.Bot):
         logger.info(f"Bot已登录: {self.user.name} (ID: {self.user.id})")
         logger.info(f"已连接到 {len(self.guilds)} 个服务器")
         
-        # 保存启动时间
-        await self.db_manager.save_startup_time(self.startup_time)
+        # 启动时更新活动时间
+        await self.db_manager.update_last_activity_time(self.startup_time)
         
-        # 获取上次关闭时间
-        self.last_shutdown_time = await self.db_manager.get_last_shutdown_time()
+        # 获取最后活动时间（用于宕机恢复）
+        self.last_activity_time = await self.db_manager.get_last_activity_time()
         
         # 设置Bot状态
         await self.set_activity()
@@ -107,32 +108,32 @@ class DiscordBot(commands.Bot):
             logger.error(f"设置活动状态失败: {e}")
     
     async def handle_downtime_recovery(self):
-        """处理宕机恢复 - 简化版"""
+        """处理宕机恢复 - 基于最后活动时间"""
         try:
             await asyncio.sleep(2)  # 等待Bot完全启动
             
-            if not self.last_shutdown_time:
-                logger.info("首次启动，跳过宕机恢复")
+            if not self.last_activity_time:
+                logger.info("首次启动或无活动记录，跳过宕机恢复")
                 return
             
-            # 解析关闭时间
-            if isinstance(self.last_shutdown_time, str):
-                shutdown_time = datetime.fromisoformat(self.last_shutdown_time)
+            # 解析最后活动时间
+            if isinstance(self.last_activity_time, str):
+                last_activity = datetime.fromisoformat(self.last_activity_time)
             else:
-                shutdown_time = self.last_shutdown_time
+                last_activity = self.last_activity_time
             
-            if shutdown_time.tzinfo is None:
-                shutdown_time = shutdown_time.replace(tzinfo=timezone.utc)
+            if last_activity.tzinfo is None:
+                last_activity = last_activity.replace(tzinfo=timezone.utc)
             
-            # 计算宕机时长
-            downtime = self.startup_time - shutdown_time
+            # 计算离线时长
+            offline_duration = self.startup_time - last_activity
             
-            # 只有宕机超过5分钟才进行恢复
-            if downtime.total_seconds() < 300:
-                logger.info(f"宕机时间较短({downtime})，跳过恢复")
+            # 只有离线超过5分钟才进行恢复
+            if offline_duration.total_seconds() < 300:
+                logger.info(f"离线时间较短({offline_duration})，跳过恢复")
                 return
             
-            logger.info(f"检测到宕机，开始恢复，宕机时长: {downtime}")
+            logger.info(f"检测到长时间离线，开始恢复，离线时长: {offline_duration}")
             
             # 获取所有配置并并发恢复
             configs = await self.db_manager.get_all_backup_configs()
@@ -142,7 +143,7 @@ class DiscordBot(commands.Bot):
             
             recovery_tasks = []
             for config in configs:
-                task = asyncio.create_task(self.recover_single_config(config, shutdown_time))
+                task = asyncio.create_task(self.recover_single_config(config, last_activity))
                 recovery_tasks.append(task)
             
             # 等待所有恢复任务完成
@@ -154,7 +155,7 @@ class DiscordBot(commands.Bot):
         except Exception as e:
             logger.error(f"宕机恢复失败: {e}")
     
-    async def recover_single_config(self, config, shutdown_time):
+    async def recover_single_config(self, config, last_activity_time):
         """恢复单个配置"""
         try:
             config_id, guild_id, channel_id, thread_id, author_id = config[:5]
@@ -171,7 +172,7 @@ class DiscordBot(commands.Bot):
                 if recovery_time.tzinfo is None:
                     recovery_time = recovery_time.replace(tzinfo=timezone.utc)
             else:
-                recovery_time = shutdown_time
+                recovery_time = last_activity_time
             
             # 执行历史扫描
             scanned, downloaded = await self.message_handler.scan_history(
@@ -229,6 +230,7 @@ class DiscordBot(commands.Bot):
                     guild_id, channel_id, thread_id, author_id, "enable"
                 )
                 
+                
                 # 执行历史扫描
                 scanned, downloaded = await self.message_handler.scan_history(
                     guild_id, channel_id, thread_id, author_id, config_id
@@ -247,6 +249,7 @@ class DiscordBot(commands.Bot):
         except Exception as e:
             logger.error(f"处理Webhook通知失败: {e}")
     
+    
     async def on_message(self, message):
         """处理消息事件"""
         # 处理备份
@@ -254,6 +257,53 @@ class DiscordBot(commands.Bot):
         
         # 处理命令
         await self.process_commands(message)
+    
+    async def on_message_edit(self, before, after):
+        """处理消息编辑事件"""
+        # 处理消息编辑的备份更新
+        await self.message_handler.handle_message_edit(before, after)
+    
+    async def on_thread_update(self, before, after):
+        """处理帖子更新事件（包括标题变更）"""
+        try:
+            # 如果帖子名称发生变化
+            if before.name != after.name:
+                # 获取该帖子的所有备份配置
+                configs = await self.db_manager.get_backup_config_by_location(
+                    after.guild.id, after.parent.id, after.id
+                )
+                
+                # 更新所有相关配置的标题
+                for config in configs:
+                    config_id = config[0]
+                    await self.db_manager.update_backup_config_title(config_id, after.name)
+                
+                if configs:
+                    logger.info(f"帖子标题更新: {before.name} -> {after.name}, 影响 {len(configs)} 个配置")
+                    
+        except Exception as e:
+            logger.error(f"处理帖子更新失败: {e}")
+    
+    async def on_guild_channel_update(self, before, after):
+        """处理频道更新事件（包括频道名称变更）"""
+        try:
+            # 如果频道名称发生变化
+            if before.name != after.name:
+                # 获取该频道的所有备份配置
+                configs = await self.db_manager.get_backup_config_by_location(
+                    after.guild.id, after.id, None
+                )
+                
+                # 更新所有相关配置的标题
+                for config in configs:
+                    config_id = config[0]
+                    await self.db_manager.update_backup_config_title(config_id, after.name)
+                
+                if configs:
+                    logger.info(f"频道标题更新: {before.name} -> {after.name}, 影响 {len(configs)} 个配置")
+                    
+        except Exception as e:
+            logger.error(f"处理频道更新失败: {e}")
     
     async def on_error(self, event, *args, **kwargs):
         """处理错误事件"""
@@ -292,20 +342,21 @@ class DiscordBot(commands.Bot):
     
     async def close(self):
         """关闭Bot"""
+        if self._shutdown_in_progress:
+            logger.debug("关闭已在进行中，跳过重复关闭")
+            return
+            
+        self._shutdown_in_progress = True
         logger.info("Bot正在关闭...")
         
         # 停止Webhook处理
         self.webhook_processor_running = False
         
-        # 保存关闭时间
-        shutdown_time = datetime.now(timezone.utc)
         try:
-            await self.db_manager.save_shutdown_time(shutdown_time)
-            logger.info(f"已保存关闭时间: {shutdown_time}")
+            await super().close()
+            logger.info("Bot关闭完成")
         except Exception as e:
-            logger.error(f"保存关闭时间失败: {e}")
-        
-        await super().close()
+            logger.error(f"Bot关闭异常: {e}")
     
     def run_bot(self):
         """运行Bot"""

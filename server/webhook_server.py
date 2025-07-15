@@ -23,15 +23,36 @@ from utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
-# 简化的Webhook数据模型
+# 作者信息模型
+class AuthorInfo(BaseModel):
+    discord_user_id: str
+    username: str
+    display_name: str
+
+# 作品信息模型
+class WorkInfo(BaseModel):
+    title: str
+    content_preview: str
+    license_type: str
+    backup_allowed: bool
+
+# URL信息模型
+class URLInfo(BaseModel):
+    discord_thread: Optional[str] = None
+    direct_message: Optional[str] = None
+
+# 完整的Webhook数据模型
 class WebhookPayload(BaseModel):
     """协议授权webhook载荷"""
     event_type: str
+    timestamp: str
     guild_id: str
     channel_id: str
     thread_id: Optional[str] = None
-    author_id: str
-    backup_allowed: bool
+    message_id: Optional[str] = None
+    author: AuthorInfo
+    work_info: WorkInfo
+    urls: Optional[URLInfo] = None
     
     @validator('event_type')
     def validate_event_type(cls, v):
@@ -60,20 +81,23 @@ class WebhookServer:
         ):
             """处理协议授权webhook - 简化版"""
             try:
-                logger.info(f"收到webhook请求: 作者 {payload.author_id}, 操作 {'启用' if payload.backup_allowed else '暂停'}")
+                logger.info(f"收到webhook请求: 作者 {payload.author.discord_user_id}, 操作 {'启用' if payload.work_info.backup_allowed else '暂停'}")
                 
                 # 转换ID
                 guild_id = int(payload.guild_id)
                 channel_id = int(payload.channel_id)
                 thread_id = int(payload.thread_id) if payload.thread_id else None
-                author_id = int(payload.author_id)
+                author_id = int(payload.author.discord_user_id)
+                
+                # 从payload获取backup_allowed状态
+                backup_allowed = payload.work_info.backup_allowed
                 
                 # 检查现有配置
                 existing_config = await self.db_manager.get_backup_config(
                     guild_id, channel_id, thread_id, author_id
                 )
                 
-                if payload.backup_allowed:
+                if backup_allowed:
                     # 启用备份
                     if existing_config:
                         logger.info(f"备份配置已存在: {existing_config[0]}")
@@ -83,9 +107,10 @@ class WebhookServer:
                             "config_id": existing_config[0]
                         }
                     
-                    # 创建新配置
+                    # 创建新配置，使用webhook中的标题信息
+                    title = payload.work_info.title if payload.work_info else None
                     config_id = await self.db_manager.create_backup_config(
-                        guild_id, channel_id, thread_id, author_id
+                        guild_id, channel_id, thread_id, author_id, title
                     )
                     
                     if config_id:
@@ -96,7 +121,15 @@ class WebhookServer:
                             "guild_id": guild_id,
                             "channel_id": channel_id,
                             "thread_id": thread_id,
-                            "author_id": author_id
+                            "author_id": author_id,
+                            "author_info": {
+                                "username": payload.author.username,
+                                "display_name": payload.author.display_name
+                            },
+                            "work_info": {
+                                "title": payload.work_info.title,
+                                "content_preview": payload.work_info.content_preview
+                            }
                         }
                         await self.notification_queue.put(notification_data)
                         
@@ -130,7 +163,11 @@ class WebhookServer:
                         "guild_id": guild_id,
                         "channel_id": channel_id,
                         "thread_id": thread_id,
-                        "author_id": author_id
+                        "author_id": author_id,
+                        "author_info": {
+                            "username": payload.author.username,
+                            "display_name": payload.author.display_name
+                        }
                     }
                     await self.notification_queue.put(notification_data)
                     

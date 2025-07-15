@@ -61,22 +61,39 @@ async def run_with_webhook(config):
     tasks.append(asyncio.create_task(run_discord_bot()))
     
     # 设置信号处理
+    shutdown_event = asyncio.Event()
+    
     def signal_handler(signum, frame):
         logger.info(f"收到信号 {signum}，正在优雅关闭...")
-        for task in tasks:
-            task.cancel()
-        asyncio.create_task(bot.close())
+        shutdown_event.set()
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
+    # 创建监控关闭信号的任务
+    async def monitor_shutdown():
+        await shutdown_event.wait()
+        logger.info("开始关闭流程...")
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # 等待Bot正确关闭
+        if not bot.is_closed():
+            await bot.close()
+    
+    tasks.append(asyncio.create_task(monitor_shutdown()))
+    
     # 等待所有任务完成
     try:
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
     except asyncio.CancelledError:
         logger.info("任务被取消，正在关闭...")
+    except Exception as e:
+        logger.error(f"任务执行异常: {e}")
     finally:
+        # 确保Bot已关闭
         if not bot.is_closed():
+            logger.info("确保Bot完全关闭...")
             await bot.close()
 
 def main():

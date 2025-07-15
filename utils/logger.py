@@ -2,8 +2,17 @@ import logging
 import sys
 from pathlib import Path
 
+# 全局标志，防止重复初始化
+_logging_setup_done = False
+
 def setup_logging(config):
     """设置日志配置"""
+    global _logging_setup_done
+    
+    # 如果已经初始化过，直接返回
+    if _logging_setup_done:
+        return
+    
     # 创建日志目录
     log_dir = Path('logs')
     log_dir.mkdir(exist_ok=True)
@@ -18,12 +27,17 @@ def setup_logging(config):
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
     
-    # 清除现有处理器
+    # 清除现有处理器，防止重复
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
     
-    # 创建格式化器
-    formatter = logging.Formatter(format_str)
+    # 创建格式化器，使用安全的格式字符串
+    try:
+        formatter = logging.Formatter(format_str)
+    except (ValueError, TypeError) as e:
+        # 如果格式字符串有问题，使用默认格式
+        print(f"警告: 日志格式配置有误 ({e})，使用默认格式")
+        formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(name)s: %(message)s')
     
     # 添加控制台处理器
     if console_enabled:
@@ -59,4 +73,6 @@ def setup_logging(config):
     aiosqlite_logger = logging.getLogger('aiosqlite')
     aiosqlite_logger.setLevel(logging.WARNING)
     
-    logging.info("日志系统初始化完成") 
+    # 标记初始化完成
+    _logging_setup_done = True
+    print("日志系统初始化完成")  # 用print避免循环 
